@@ -45,6 +45,7 @@ import (
 	"gopkg.in/yaml.v2"
 
 	dto "github.com/prometheus/client_model/go"
+	promconfig "github.com/prometheus/common/config"
 	"github.com/prometheus/common/expfmt"
 
 	"github.com/prometheus/prometheus/config"
@@ -74,6 +75,8 @@ const (
 var lintOptions = []string{lintOptionAll, lintOptionDuplicateRules, lintOptionNone}
 
 func main() {
+	var queryCmdServer *url.URL
+
 	app := kingpin.New(filepath.Base(os.Args[0]), "Tooling for the Prometheus monitoring system.").UsageWriter(os.Stdout)
 	app.Version(version.Print("promtool"))
 	app.HelpFlag.Short('h')
@@ -124,14 +127,15 @@ func main() {
 
 	queryCmd := app.Command("query", "Run query against a Prometheus server.")
 	queryCmdFmt := queryCmd.Flag("format", "Output format of the query.").Short('o').Default("promql").Enum("promql", "json")
+	queryCmdHTTPConfigFile := queryCmd.Flag("http.config.file", "HTTP client configuration file for promtool to connect to Prometheus.").PlaceHolder("<filename>").ExistingFile()
 
 	queryInstantCmd := queryCmd.Command("instant", "Run instant query.")
-	queryInstantServer := queryInstantCmd.Arg("server", "Prometheus server to query.").Required().URL()
+	queryInstantCmd.Arg("server", "Prometheus server to query.").Required().URLVar(&queryCmdServer)
 	queryInstantExpr := queryInstantCmd.Arg("expr", "PromQL query expression.").Required().String()
 	queryInstantTime := queryInstantCmd.Flag("time", "Query evaluation time (RFC3339 or Unix timestamp).").String()
 
 	queryRangeCmd := queryCmd.Command("range", "Run range query.")
-	queryRangeServer := queryRangeCmd.Arg("server", "Prometheus server to query.").Required().URL()
+	queryRangeCmd.Arg("server", "Prometheus server to query.").Required().URLVar(&queryCmdServer)
 	queryRangeExpr := queryRangeCmd.Arg("expr", "PromQL query expression.").Required().String()
 	queryRangeHeaders := queryRangeCmd.Flag("header", "Extra headers to send to server.").StringMap()
 	queryRangeBegin := queryRangeCmd.Flag("start", "Query range start time (RFC3339 or Unix timestamp).").String()
@@ -139,7 +143,7 @@ func main() {
 	queryRangeStep := queryRangeCmd.Flag("step", "Query step size (duration).").Duration()
 
 	querySeriesCmd := queryCmd.Command("series", "Run series query.")
-	querySeriesServer := querySeriesCmd.Arg("server", "Prometheus server to query.").Required().URL()
+	querySeriesCmd.Arg("server", "Prometheus server to query.").Required().URLVar(&queryCmdServer)
 	querySeriesMatch := querySeriesCmd.Flag("match", "Series selector. Can be specified multiple times.").Required().Strings()
 	querySeriesBegin := querySeriesCmd.Flag("start", "Start time (RFC3339 or Unix timestamp).").String()
 	querySeriesEnd := querySeriesCmd.Flag("end", "End time (RFC3339 or Unix timestamp).").String()
@@ -153,7 +157,7 @@ func main() {
 	debugAllServer := debugAllCmd.Arg("server", "Prometheus server to get all debug information from.").Required().String()
 
 	queryLabelsCmd := queryCmd.Command("labels", "Run labels query.")
-	queryLabelsServer := queryLabelsCmd.Arg("server", "Prometheus server to query.").Required().URL()
+	queryLabelsCmd.Arg("server", "Prometheus server to query.").Required().URLVar(&queryCmdServer)
 	queryLabelsName := queryLabelsCmd.Arg("name", "Label name to provide label values for.").Required().String()
 	queryLabelsBegin := queryLabelsCmd.Flag("start", "Start time (RFC3339 or Unix timestamp).").String()
 	queryLabelsEnd := queryLabelsCmd.Flag("end", "End time (RFC3339 or Unix timestamp).").String()
@@ -276,13 +280,13 @@ func main() {
 		os.Exit(CheckMetrics(*checkMetricsExtended))
 
 	case queryInstantCmd.FullCommand():
-		os.Exit(QueryInstant(*queryInstantServer, *queryInstantExpr, *queryInstantTime, p))
+		os.Exit(QueryInstant(queryCmdServer, httpRoundTripper, *queryInstantExpr, *queryInstantTime, p))
 
 	case queryRangeCmd.FullCommand():
-		os.Exit(QueryRange(*queryRangeServer, *queryRangeHeaders, *queryRangeExpr, *queryRangeBegin, *queryRangeEnd, *queryRangeStep, p))
+		os.Exit(QueryRange(queryCmdServer, httpRoundTripper, *queryRangeHeaders, *queryRangeExpr, *queryRangeBegin, *queryRangeEnd, *queryRangeStep, p))
 
 	case querySeriesCmd.FullCommand():
-		os.Exit(QuerySeries(*querySeriesServer, *querySeriesMatch, *querySeriesBegin, *querySeriesEnd, p))
+		os.Exit(QuerySeries(queryCmdServer, httpRoundTripper, *querySeriesMatch, *querySeriesBegin, *querySeriesEnd, p))
 
 	case debugPprofCmd.FullCommand():
 		os.Exit(debugPprof(*debugPprofServer))
@@ -294,7 +298,7 @@ func main() {
 		os.Exit(debugAll(*debugAllServer))
 
 	case queryLabelsCmd.FullCommand():
-		os.Exit(QueryLabels(*queryLabelsServer, *queryLabelsMatch, *queryLabelsName, *queryLabelsBegin, *queryLabelsEnd, p))
+		os.Exit(QueryLabels(queryCmdServer, httpRoundTripper, *queryLabelsMatch, *queryLabelsName, *queryLabelsBegin, *queryLabelsEnd, p))
 
 	case testRulesCmd.FullCommand():
 		os.Exit(RulesUnitTest(
@@ -813,12 +817,13 @@ func checkMetricsExtended(r io.Reader) ([]metricStat, int, error) {
 }
 
 // QueryInstant performs an instant query against a Prometheus server.
-func QueryInstant(url *url.URL, query, evalTime string, p printer) int {
+func QueryInstant(url *url.URL, roundTripper http.RoundTripper, query, evalTime string, p printer) int {
 	if url.Scheme == "" {
 		url.Scheme = "http"
 	}
 	config := api.Config{
-		Address: url.String(),
+		Address:      url.String(),
+		RoundTripper: roundTripper,
 	}
 
 	// Create new client.
@@ -853,12 +858,13 @@ func QueryInstant(url *url.URL, query, evalTime string, p printer) int {
 }
 
 // QueryRange performs a range query against a Prometheus server.
-func QueryRange(url *url.URL, headers map[string]string, query, start, end string, step time.Duration, p printer) int {
+func QueryRange(url *url.URL, roundTripper http.RoundTripper, headers map[string]string, query, start, end string, step time.Duration, p printer) int {
 	if url.Scheme == "" {
 		url.Scheme = "http"
 	}
 	config := api.Config{
-		Address: url.String(),
+		Address:      url.String(),
+		RoundTripper: roundTripper,
 	}
 
 	if len(headers) > 0 {
@@ -866,7 +872,7 @@ func QueryRange(url *url.URL, headers map[string]string, query, start, end strin
 			for key, value := range headers {
 				req.Header.Add(key, value)
 			}
-			return http.DefaultTransport.RoundTrip(req)
+			return roundTripper.RoundTrip(req)
 		})
 	}
 
@@ -926,12 +932,13 @@ func QueryRange(url *url.URL, headers map[string]string, query, start, end strin
 }
 
 // QuerySeries queries for a series against a Prometheus server.
-func QuerySeries(url *url.URL, matchers []string, start, end string, p printer) int {
+func QuerySeries(url *url.URL, roundTripper http.RoundTripper, matchers []string, start, end string, p printer) int {
 	if url.Scheme == "" {
 		url.Scheme = "http"
 	}
 	config := api.Config{
-		Address: url.String(),
+		Address:      url.String(),
+		RoundTripper: roundTripper,
 	}
 
 	// Create new client.
@@ -962,12 +969,13 @@ func QuerySeries(url *url.URL, matchers []string, start, end string, p printer) 
 }
 
 // QueryLabels queries for label values against a Prometheus server.
-func QueryLabels(url *url.URL, matchers []string, name, start, end string, p printer) int {
+func QueryLabels(url *url.URL, roundTripper http.RoundTripper, matchers []string, name, start, end string, p printer) int {
 	if url.Scheme == "" {
 		url.Scheme = "http"
 	}
 	config := api.Config{
-		Address: url.String(),
+		Address:      url.String(),
+		RoundTripper: roundTripper,
 	}
 
 	// Create new client.
