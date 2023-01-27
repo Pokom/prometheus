@@ -230,25 +230,19 @@ func main() {
 
 	httpRoundTripper := api.DefaultRoundTripper
 
+	var configFile *string
 	if *queryCmdHTTPConfigFile != "" {
+		configFile = queryCmdHTTPConfigFile
+	} else if *importCmdConfigFile != "" {
+		configFile = importCmdConfigFile
+	}
+
+	if *configFile != "" {
 		if queryCmdServer.User.Username() != "" {
 			kingpin.Fatalf("Cannot set base auth in the server URL and use a http.config.file at the same time")
 		}
 		var err error
-		httpConfig, _, err := config_util.LoadHTTPConfigFile(*queryCmdHTTPConfigFile)
-		if err != nil {
-			kingpin.Fatalf("Failed to load HTTP config file: %v", err)
-		}
-
-		httpRoundTripper, err = promconfig.NewRoundTripperFromConfig(*httpConfig, "promtool", config_util.WithUserAgent("promtool/"+version.Version))
-		if err != nil {
-			kingpin.Fatalf("Failed to create a new HTTP round tripper: %v", err)
-		}
-	}
-
-	if *importCmdConfigFile != "" {
-		var err error
-		httpConfig, _, err := config_util.LoadHTTPConfigFile(*importCmdConfigFile)
+		httpConfig, _, err := config_util.LoadHTTPConfigFile(*configFile)
 		if err != nil {
 			kingpin.Fatalf("Failed to load HTTP config file: %v", err)
 		}
