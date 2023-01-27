@@ -128,7 +128,6 @@ func main() {
 	queryCmd := app.Command("query", "Run query against a Prometheus server.")
 	queryCmdFmt := queryCmd.Flag("format", "Output format of the query.").Short('o').Default("promql").Enum("promql", "json")
 	queryCmdHTTPConfigFile := queryCmd.Flag("http.config.file", "HTTP client configuration file for promtool to connect to Prometheus.").PlaceHolder("<filename>").ExistingFile()
-
 	queryInstantCmd := queryCmd.Command("instant", "Run instant query.")
 	queryInstantCmd.Arg("server", "Prometheus server to query.").Required().URLVar(&queryCmdServer)
 	queryInstantExpr := queryInstantCmd.Arg("expr", "PromQL query expression.").Required().String()
@@ -197,6 +196,7 @@ func main() {
 	dumpMatch := tsdbDumpCmd.Flag("match", "Series selector.").Default("{__name__=~'(?s:.*)'}").String()
 
 	importCmd := tsdbCmd.Command("create-blocks-from", "[Experimental] Import samples from input and produce TSDB blocks. Please refer to the storage docs for more details.")
+	importCmdConfigFile := importCmd.Flag("http.config.file", "HTTP client configuration file for promtool to connect to Prometheus.").PlaceHolder("<filename>").ExistingFile()
 	importHumanReadable := importCmd.Flag("human-readable", "Print human readable values.").Short('r').Bool()
 	importQuiet := importCmd.Flag("quiet", "Do not print created blocks.").Short('q').Bool()
 	maxBlockDuration := importCmd.Flag("max-block-duration", "Maximum duration created blocks may span. Anything less than 2h is ignored.").Hidden().PlaceHolder("<duration>").Duration()
@@ -236,6 +236,19 @@ func main() {
 		}
 		var err error
 		httpConfig, _, err := config_util.LoadHTTPConfigFile(*queryCmdHTTPConfigFile)
+		if err != nil {
+			kingpin.Fatalf("Failed to load HTTP config file: %v", err)
+		}
+
+		httpRoundTripper, err = promconfig.NewRoundTripperFromConfig(*httpConfig, "promtool", config_util.WithUserAgent("promtool/"+version.Version))
+		if err != nil {
+			kingpin.Fatalf("Failed to create a new HTTP round tripper: %v", err)
+		}
+	}
+
+	if *importCmdConfigFile != "" {
+		var err error
+		httpConfig, _, err := config_util.LoadHTTPConfigFile(*importCmdConfigFile)
 		if err != nil {
 			kingpin.Fatalf("Failed to load HTTP config file: %v", err)
 		}
@@ -325,7 +338,7 @@ func main() {
 		os.Exit(backfillOpenMetrics(*importFilePath, *importDBPath, *importHumanReadable, *importQuiet, *maxBlockDuration))
 
 	case importRulesCmd.FullCommand():
-		os.Exit(checkErr(importRules(*importRulesURL, *importRulesStart, *importRulesEnd, *importRulesOutputDir, *importRulesEvalInterval, *maxBlockDuration, *importRulesFiles...)))
+		os.Exit(checkErr(importRules(*importRulesURL, httpRoundTripper, *importRulesStart, *importRulesEnd, *importRulesOutputDir, *importRulesEvalInterval, *maxBlockDuration, *importRulesFiles...)))
 	}
 }
 
@@ -1180,7 +1193,7 @@ func (j *jsonPrinter) printLabelValues(v model.LabelValues) {
 
 // importRules backfills recording rules from the files provided. The output are blocks of data
 // at the outputDir location.
-func importRules(url *url.URL, start, end, outputDir string, evalInterval, maxBlockDuration time.Duration, files ...string) error {
+func importRules(url *url.URL, httpRoundTripper http.RoundTripper, start, end, outputDir string, evalInterval, maxBlockDuration time.Duration, files ...string) error {
 	ctx := context.Background()
 	var stime, etime time.Time
 	var err error
@@ -1210,7 +1223,8 @@ func importRules(url *url.URL, start, end, outputDir string, evalInterval, maxBl
 		maxBlockDuration: maxBlockDuration,
 	}
 	client, err := api.NewClient(api.Config{
-		Address: url.String(),
+		Address:      url.String(),
+		RoundTripper: httpRoundTripper,
 	})
 	if err != nil {
 		return fmt.Errorf("new api client error: %w", err)
